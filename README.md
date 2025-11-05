@@ -1,0 +1,1 @@
+frigate_sftp_upload

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  frigate-sftp-upload:
+    build: .
+    container_name: frigate-sftp-upload
+    restart: unless-stopped
+    volumes:
+      - /path/to/frigate/media:/media/frigate:ro
+      # Jos käytät SSH-avainta, liitä se volumeen:
+      # - /path/to/ssh/keys:/ssh_keys:ro
+    environment:
+      # Pakolliset asetukset
+      - SFTP_HOST=192.168.0.116
+      - SFTP_USERNAME=camera
+      
+      # Joko salasana tai SSH-avain (valitse toinen)
+      - SFTP_PASSWORD=password
+      # - SFTP_PRIVATE_KEY_PATH=/ssh_keys/id_rsa
+      
+      # Valinnaiset asetukset
+      - SFTP_PORT=22
+      - SFTP_REMOTE_DIR=/uploads
+      - FRIGATE_CLIPS_DIR=/media/frigate/clips
+      - UPLOAD_EXTENSIONS=["jpg","jpeg","png","mp4"]
+      - LOG_LEVEL=INFO
