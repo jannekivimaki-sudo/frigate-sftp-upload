@@ -24,3 +24,8 @@ services:
       - FRIGATE_CLIPS_DIR=/media/frigate/clips
       - UPLOAD_EXTENSIONS=["jpg","jpeg","png","mp4"]
       - LOG_LEVEL=INFO
+      
+      # Uudelleenyritysasetukset
+      - RETRY_INTERVAL_MINUTES=5
+      - MAX_RETRY_ATTEMPTS=10
+      - FAILED_UPLOADS_FILE=/app/failed_uploads.json

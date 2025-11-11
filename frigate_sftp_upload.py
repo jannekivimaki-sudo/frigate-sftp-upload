@@ -6,6 +6,8 @@ from watchdog.events import FileSystemEventHandler
 from pathlib import Path
 import logging
 import json
+import threading
+from datetime import datetime, timedelta
 
 # Konfiguraatio ympäristömuuttujista
 FRIGATE_CLIPS_DIR = os.getenv('FRIGATE_CLIPS_DIR', '/media/frigate/clips')
@@ -18,6 +20,11 @@ SFTP_REMOTE_DIR = os.getenv('SFTP_REMOTE_DIR', '/uploads')
 
 # Tiedostotunnisteet, jotka lähetetään
 UPLOAD_EXTENSIONS = json.loads(os.getenv('UPLOAD_EXTENSIONS', '["jpg", "jpeg", "png", "mp4", "avi", "mov"]'))
+
+# Uudelleenyritysasetukset
+RETRY_INTERVAL_MINUTES = int(os.getenv('RETRY_INTERVAL_MINUTES', '5'))
+MAX_RETRY_ATTEMPTS = int(os.getenv('MAX_RETRY_ATTEMPTS', '10'))
+FAILED_UPLOADS_FILE = os.getenv('FAILED_UPLOADS_FILE', '/app/failed_uploads.json')
 
 # Lokituksen asetukset
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -35,8 +42,41 @@ class FrigateClipHandler(FileSystemEventHandler):
         self.sftp_client = None
         self.connected = False
         self.processed_files = set()
+        self.failed_uploads = {}
+        self.successful_uploads = set()
+        self.upload_lock = threading.Lock()
+        self.load_failed_uploads()
         self.connect_sftp()
         
+    def load_failed_uploads(self):
+        """Lataa epäonnistuneiden siirtojen tiedot tiedostosta"""
+        try:
+            if os.path.exists(FAILED_UPLOADS_FILE):
+                with open(FAILED_UPLOADS_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.failed_uploads = data.get('failed', {})
+                    self.successful_uploads = set(data.get('successful', []))
+                    logger.info(f"Ladattu {len(self.failed_uploads)} epäonnistunutta siirtoa tiedostosta")
+        except Exception as e:
+            logger.error(f"Epäonnistuneiden siirtojen lataaminen epäonnistui: {e}")
+            self.failed_uploads = {}
+            self.successful_uploads = set()
+    
+    def save_failed_uploads(self):
+        """Tallenna epäonnistuneiden siirtojen tiedot tiedostoon"""
+        try:
+            with self.upload_lock:
+                data = {
+                    'failed': self.failed_uploads,
+                    'successful': list(self.successful_uploads)
+                }
+                # Varmista että kansio on olemassa
+                os.makedirs(os.path.dirname(FAILED_UPLOADS_FILE), exist_ok=True)
+                with open(FAILED_UPLOADS_FILE, 'w') as f:
+                    json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Epäonnistuneiden siirtojen tallentaminen epäonnistui: {e}")
+    
     def connect_sftp(self):
         """Yhdistä SFTP-palvelimeen"""
         max_retries = 3
@@ -92,12 +132,13 @@ class FrigateClipHandler(FileSystemEventHandler):
                     logger.error("Kaikki SFTP-yhteyden yritykset epäonnistuivat")
                     self.connected = False
     
-    def upload_file(self, file_path):
+    def upload_file(self, file_path, is_retry=False):
         """Lähetä tiedosto SFTP-palvelimelle"""
         if not self.connected:
             logger.warning("Ei aktiivista SFTP-yhteyttä, yritetään uudelleen...")
             self.connect_sftp()
             if not self.connected:
+                self.record_failed_upload(file_path, "Ei SFTP-yhteyttä")
                 return False
         
         try:
@@ -107,22 +148,56 @@ class FrigateClipHandler(FileSystemEventHandler):
             # Tarkista, onko tiedosto valmis (ei kirjoitettavana)
             if self.is_file_ready(file_path):
                 file_size = os.path.getsize(file_path)
-                logger.info(f"Lähetetään tiedosto: {file_name} ({file_size} bytes)")
+                retry_info = f" (uudelleenyritys)" if is_retry else ""
+                logger.info(f"Lähetetään tiedosto{retry_info}: {file_name} ({file_size} bytes)")
                 
                 self.sftp_client.put(file_path, remote_path)
                 
                 logger.info(f"Tiedosto {file_name} lähetetty onnistuneesti")
-                self.processed_files.add(file_path)
+                self.record_successful_upload(file_path)
                 return True
             else:
                 logger.warning(f"Tiedosto {file_name} ei ole valmis, ohitetaan")
+                # Jos tiedosto ei ole valmis, ei kirjata epäonnistuneeksi (yritetään myöhemmin)
                 return False
                 
         except Exception as e:
             logger.error(f"Tiedoston {file_path} lähetys epäonnistui: {e}")
+            self.record_failed_upload(file_path, str(e))
             # Yritä uudelleenyhdistää seuraavaa yritystä varten
             self.connected = False
             return False
+    
+    def record_successful_upload(self, file_path):
+        """Kirjaa onnistunut siirto"""
+        with self.upload_lock:
+            self.processed_files.add(file_path)
+            self.successful_uploads.add(file_path)
+            # Poista epäonnistuneiden listasta jos siellä
+            if file_path in self.failed_uploads:
+                del self.failed_uploads[file_path]
+            self.save_failed_uploads()
+    
+    def record_failed_upload(self, file_path, error_message):
+        """Kirjaa epäonnistunut siirto"""
+        with self.upload_lock:
+            current_time = datetime.now().isoformat()
+            
+            if file_path not in self.failed_uploads:
+                self.failed_uploads[file_path] = {
+                    'attempt_count': 1,
+                    'first_attempt': current_time,
+                    'last_attempt': current_time,
+                    'last_error': error_message
+                }
+                logger.warning(f"Tiedosto lisätty epäonnistuneiden listaan: {file_path}")
+            else:
+                self.failed_uploads[file_path]['attempt_count'] += 1
+                self.failed_uploads[file_path]['last_attempt'] = current_time
+                self.failed_uploads[file_path]['last_error'] = error_message
+                logger.warning(f"Päivitetty epäonnistuneen siirron tiedot: {file_path} (yritys {self.failed_uploads[file_path]['attempt_count']})")
+            
+            self.save_failed_uploads()
     
     def is_file_ready(self, file_path):
         """Tarkista onko tiedosto valmis lukemista/lähetystä varten"""
@@ -157,8 +232,8 @@ class FrigateClipHandler(FileSystemEventHandler):
         file_path = event.src_path
         file_ext = os.path.splitext(file_path)[1].lower().lstrip('.')
         
-        # Tarkista onko tiedosto jo käsitelty
-        if file_path in self.processed_files:
+        # Tarkista onko tiedosto jo käsitelty onnistuneesti
+        if file_path in self.successful_uploads:
             return
             
         # Lähetä vain sallitut tiedostotyypit
@@ -169,12 +244,37 @@ class FrigateClipHandler(FileSystemEventHandler):
             time.sleep(3)
             
             # Yritä lähettää tiedosto
-            success = self.upload_file(file_path)
+            self.upload_file(file_path)
+    
+    def retry_failed_uploads(self):
+        """Yritä lähettää epäonnistuneet tiedostot uudelleen"""
+        if not self.failed_uploads:
+            return
+        
+        logger.info(f"Yritetään lähettää {len(self.failed_uploads)} epäonnistunutta tiedostoa uudelleen...")
+        
+        # Kopioi lista jotta voi muokata alkuperäistä iteroidessa
+        failed_list = list(self.failed_uploads.keys())
+        
+        for file_path in failed_list:
+            # Tarkista onko tiedosto vielä olemassa
+            if not os.path.exists(file_path):
+                logger.warning(f"Tiedosto ei enää ole olemassa, poistetaan listasta: {file_path}")
+                with self.upload_lock:
+                    if file_path in self.failed_uploads:
+                        del self.failed_uploads[file_path]
+                    self.save_failed_uploads()
+                continue
             
-            if not success:
-                logger.warning(f"Lähetys epäonnistui, yritetään uudelleen 10 sekunnin kuluttua")
-                time.sleep(10)
-                self.upload_file(file_path)
+            # Tarkista onko maksimimäärä yrityksiä ylitetty
+            attempt_count = self.failed_uploads[file_path]['attempt_count']
+            if attempt_count >= MAX_RETRY_ATTEMPTS:
+                logger.error(f"Tiedosto {file_path} ylitti maksimimäärän yrityksiä ({MAX_RETRY_ATTEMPTS}), jätetään listaan")
+                continue
+            
+            # Yritä lähettää
+            logger.info(f"Yritetään lähettää tiedosto uudelleen ({attempt_count + 1}/{MAX_RETRY_ATTEMPTS}): {file_path}")
+            self.upload_file(file_path, is_retry=True)
     
     def cleanup(self):
         """Siivoa resurssit"""
@@ -232,14 +332,24 @@ def main():
     try:
         observer.start()
         logger.info("Tiedostotarkkailu käynnistetty onnistuneesti")
+        logger.info(f"Epäonnistuneita siirtoja yritetään uudelleen {RETRY_INTERVAL_MINUTES} minuutin välein")
+        
+        # Laske seuraava uudelleenyritysaika
+        next_retry_time = datetime.now() + timedelta(minutes=RETRY_INTERVAL_MINUTES)
         
         # Pidä sovellus käynnissä
         while True:
             time.sleep(10)
+            
             # Tarkista säännöllisesti SFTP-yhteys
             if not event_handler.connected:
                 logger.warning("SFTP-yhteys katkaistu, yritetään uudelleen...")
                 event_handler.connect_sftp()
+            
+            # Yritä epäonnistuneet siirrot uudelleen säännöllisesti
+            if datetime.now() >= next_retry_time:
+                event_handler.retry_failed_uploads()
+                next_retry_time = datetime.now() + timedelta(minutes=RETRY_INTERVAL_MINUTES)
             
     except KeyboardInterrupt:
         logger.info("Sovellus suljetaan...")
