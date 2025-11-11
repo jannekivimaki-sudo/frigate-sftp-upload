@@ -71,7 +71,9 @@ class FrigateClipHandler(FileSystemEventHandler):
                     'successful': list(self.successful_uploads)
                 }
                 # Varmista että kansio on olemassa
-                os.makedirs(os.path.dirname(FAILED_UPLOADS_FILE), exist_ok=True)
+                dir_path = os.path.dirname(FAILED_UPLOADS_FILE)
+                if dir_path:  # Only create if dirname is not empty
+                    os.makedirs(dir_path, exist_ok=True)
                 with open(FAILED_UPLOADS_FILE, 'w') as f:
                     json.dump(data, f, indent=2)
         except Exception as e:
@@ -176,7 +178,8 @@ class FrigateClipHandler(FileSystemEventHandler):
             # Poista epäonnistuneiden listasta jos siellä
             if file_path in self.failed_uploads:
                 del self.failed_uploads[file_path]
-            self.save_failed_uploads()
+        # Save outside the lock to avoid deadlock
+        self.save_failed_uploads()
     
     def record_failed_upload(self, file_path, error_message):
         """Kirjaa epäonnistunut siirto"""
@@ -196,8 +199,9 @@ class FrigateClipHandler(FileSystemEventHandler):
                 self.failed_uploads[file_path]['last_attempt'] = current_time
                 self.failed_uploads[file_path]['last_error'] = error_message
                 logger.warning(f"Päivitetty epäonnistuneen siirron tiedot: {file_path} (yritys {self.failed_uploads[file_path]['attempt_count']})")
-            
-            self.save_failed_uploads()
+        
+        # Save outside the lock to avoid deadlock
+        self.save_failed_uploads()
     
     def is_file_ready(self, file_path):
         """Tarkista onko tiedosto valmis lukemista/lähetystä varten"""
